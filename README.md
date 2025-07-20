@@ -59,6 +59,53 @@ Filters the data based on a query string and displays the results.
 python xq.py path/to/your/data.xlsx flt "query_string"
 ```
 
+### `tag-set`, `tag-unset`, `tag-ls`
+
+Manage computed fields (tags) which are new columns derived from existing data.
+
+-   `tag-set`: Creates a new or modifies an existing computed field.
+-   `tag-unset`: Removes a computed field.
+-   `tag-ls`: Lists all existing computed fields.
+
+#### Tag Expression Language
+
+When you create a computed field with `tag-set`, you provide a name for the new field and an expression to calculate its value. This expression language is designed to be simple and intuitive, allowing you to reference other columns by their short names.
+
+**Syntax:**
+
+The expression is a string that follows standard Python arithmetic and logical operations. To reference another field, enclose its **short name** in curly braces `{}`.
+
+**Examples:**
+
+Let's assume you have the following fields and short names:
+
+| Field Name  | Short Name |
+| :---------- | :--------- |
+| `unit-price`| `price`    |
+| `quantity`  | `qty`      |
+| `tax-rate`  | `tax`      |
+
+1.  **Calculate Total Cost**: Create a new field `total-cost` by multiplying `unit-price` and `quantity`.
+
+    ```bash
+    python xq.py data.csv tag-set total-cost "{price} * {qty}"
+    ```
+
+2.  **Calculate Price with Tax**: Create a `final-price` field that includes tax.
+
+    ```bash
+    python xq.py data.csv tag-set final-price "{price} * (1 + {tax})"
+    ```
+
+3.  **Conditional Logic (Future)**: *While not yet implemented, the language is designed to be extended with more complex logic, such as conditional statements.*
+
+    ```bash
+    # (Example of a possible future enhancement)
+    # python xq.py data.csv tag-set category "if {price} > 100 then 'premium' else 'standard'"
+    ```
+
+This approach allows you to build powerful, readable expressions for data transformation directly from the command line.
+
 ### Filter Query Language
 
 The filter query is a comma-separated string of expressions. Each expression can either be a **filter condition** or a **column name** to include in the output.
