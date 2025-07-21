@@ -7,16 +7,445 @@ import json
 import logging
 import hashlib
 import pickle
+import fnmatch
+import traceback
+import inspect
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Union
+from functools import wraps
 
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
-from typer_di import TyperDI, Depends
-from typer import Option, Argument, Exit, Typer
+from rich.panel import Panel
+from rich.text import Text
+import typer
+from typer import Option, Argument, Exit, Typer, Context
 import re
+
+# --- CLI Framework ---
+
+@dataclass
+class CommonOptions:
+    """Common CLI options that can be used globally and locally."""
+    format: Optional[str] = field(
+        default=None,
+        metadata={
+            "option": ["--format", "-f"],
+            "help": "Output format (table, json)",
+            "default_tty": "table",
+            "default_pipe": "json"
+        }
+    )
+    verbose: int = field(
+        default=1,
+        metadata={
+            "option": ["--verbose", "-v"],
+            "help": "Verbosity (0-3)"
+        }
+    )
+
+
+
+# Remove verbose request DTOs - use simple method parameters
+
+# --- Output DTOs ---
+
+@dataclass
+class FieldInfo:
+    """Information about a single field."""
+    cid: int
+    name: str
+    short_name: str
+    dtype: str
+
+@dataclass
+class SchemaResponse:
+    """Response DTO for schema command."""
+    fields: List[FieldInfo]
+    computed_fields: Dict[str, str]
+    file_name: str
+
+@dataclass
+class FilterResponse:
+    """Response DTO for filter command."""
+    records: List[Dict[str, Any]]
+
+@dataclass
+class TagInfo:
+    """Information about a computed field tag."""
+    name: str
+    expression: str
+
+@dataclass
+class TagListResponse:
+    """Response DTO for tag list command."""
+    tags: List[TagInfo]
+
+@dataclass
+class TagSetResponse:
+    """Response DTO for tag set command."""
+    field_name: str
+    success: bool
+    message: str
+
+@dataclass
+class TagUnsetResponse:
+    """Response DTO for tag unset command."""
+    field_name: str
+    success: bool
+    message: str
+
+class CLIError(Exception):
+    """Base exception for CLI errors."""
+    def __init__(self, message: str, exit_code: int = 1):
+        self.message = message
+        self.exit_code = exit_code
+        super().__init__(message)
+
+class ApplicationError(CLIError):
+    """Exception for application logic errors."""
+    pass
+
+class ValidationError(CLIError):
+    """Exception for input validation errors."""
+    pass
+
+class FileNotFoundError(CLIError):
+    """Exception for file not found errors."""
+    def __init__(self, file_path: str):
+        super().__init__(f"File not found: {file_path}", exit_code=2)
+
+class OutputRenderer:
+    """Unified output renderer for all response DTOs."""
+
+    def __init__(self, console: Console, format: Optional[str] = None, common_options: Optional[CommonOptions] = None):
+        self.console = console
+        self.format = self._determine_format(format, common_options)
+
+    def _determine_format(self, format: Optional[str], common_options: Optional[CommonOptions]) -> str:
+        """Determine output format using dataclass metadata for defaults."""
+        if format:
+            return format
+
+        # Use metadata from CommonOptions for smart defaults
+        if common_options:
+            format_field = CommonOptions.__dataclass_fields__['format']
+            if sys.stdout.isatty():
+                return format_field.metadata.get('default_tty', 'table')
+            else:
+                return format_field.metadata.get('default_pipe', 'json')
+
+        # Fallback
+        return 'table' if sys.stdout.isatty() else 'json'
+
+    def render(self, response: Any) -> None:
+        """Render any response DTO based on its type."""
+        if self.format == "json":
+            self._render_json(response)
+        else:
+            self._render_table(response)
+
+    def _render_json(self, response: Any) -> None:
+        """Render response as JSON."""
+        import json
+        from dataclasses import asdict
+
+        # For filter responses, output just the records array directly
+        if isinstance(response, FilterResponse):
+            self.console.print(json.dumps(response.records, indent=2))
+        else:
+            self.console.print(json.dumps(asdict(response), indent=2))
+
+    def _render_table(self, response: Any) -> None:
+        """Render response as a Rich table."""
+        if isinstance(response, SchemaResponse):
+            self._render_schema_table(response)
+        elif isinstance(response, FilterResponse):
+            self._render_filter_table(response)
+        elif isinstance(response, TagListResponse):
+            self._render_tag_list_table(response)
+        elif isinstance(response, (TagSetResponse, TagUnsetResponse)):
+            self._render_tag_operation_result(response)
+        else:
+            self.console.print(f"[yellow]Unknown response type: {type(response)}[/yellow]")
+
+    def _render_schema_table(self, response: SchemaResponse) -> None:
+        """Render schema response as table."""
+        table = Table(title=f"Schema for {response.file_name}")
+        table.add_column("CID", style="yellow")
+        table.add_column("Field Name", style="cyan")
+        table.add_column("Short Name", style="green")
+        table.add_column("Data Type", style="magenta")
+
+        for field in response.fields:
+            table.add_row(str(field.cid), field.name, field.short_name, field.dtype)
+
+        self.console.print(table)
+
+        if response.computed_fields:
+            computed_table = Table(title="Computed Fields (Tags)")
+            computed_table.add_column("Tag Name", style="cyan")
+            computed_table.add_column("Expression", style="green")
+            for name, expr in response.computed_fields.items():
+                computed_table.add_row(name, expr)
+            self.console.print(computed_table)
+
+    def _render_filter_table(self, response: FilterResponse) -> None:
+        """Render filter response as table."""
+        if not response.records:
+            self.console.print("[yellow]No records found matching the query.[/yellow]")
+            return
+
+        # Get columns from first record
+        columns = list(response.records[0].keys()) if response.records else []
+
+        table = Table(title="Filtered Results", expand=True)
+        for col in columns:
+            table.add_column(col, style="cyan", no_wrap=True)
+
+        for record in response.records:
+            table.add_row(*[str(record.get(col, "")) for col in columns])
+
+        self.console.print(table)
+
+    def _render_tag_list_table(self, response: TagListResponse) -> None:
+        """Render tag list response as table."""
+        if not response.tags:
+            self.console.print("[yellow]No computed fields (tags) found.[/yellow]")
+            return
+
+        table = Table(title="Computed Fields (Tags)")
+        table.add_column("Tag Name", style="cyan")
+        table.add_column("Expression", style="green")
+
+        for tag in response.tags:
+            table.add_row(tag.name, tag.expression)
+
+        self.console.print(table)
+
+    def _render_tag_operation_result(self, response: Union[TagSetResponse, TagUnsetResponse]) -> None:
+        """Render tag operation result."""
+        if response.success:
+            self.console.print(f"[green]{response.message}[/green]")
+        else:
+            self.console.print(f"[red]{response.message}[/red]")
+
+class TyperCommonOptions:
+    """
+    Generic Typer wrapper with:
+    - Automatic common option injection from dataclass
+    - Exception handling with full stack traces
+    - Clean method routing via decorators
+    """
+
+    def __init__(self, app_title: str, app_class: type, common_options_class: type = CommonOptions, needs_file_input: bool = True):
+        self.console = Console()
+        self.app = typer.Typer(help=app_title)
+        self.app_class = app_class
+        self.app_instance = None
+        self.common_options_class = common_options_class
+        self.global_options = common_options_class()
+        self.needs_file_input = needs_file_input
+
+        # Parse positional file argument if needed
+        if self.needs_file_input:
+            self.file_path = self._extract_file_arg()
+
+        # Setup global callback with dynamic options
+        self._setup_global_callback()
+
+    def _setup_global_callback(self):
+        """Setup global callback with options derived from CommonOptions dataclass."""
+        # Create callback signature from CommonOptions fields
+        params = [inspect.Parameter('ctx', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context)]
+
+        for field_name, field in self.common_options_class.__dataclass_fields__.items():
+            option_args = field.metadata.get('option', [f'--{field_name}'])
+            help_text = field.metadata.get('help', '')
+            default_val = field.default if field.default != field.default_factory else field.default_factory()
+
+            param = inspect.Parameter(
+                field_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=Option(default_val, *option_args, help=help_text),
+                annotation=field.type
+            )
+            params.append(param)
+
+        def callback_impl(ctx: Context, **kwargs):
+            # Update global options
+            for key, value in kwargs.items():
+                if hasattr(self.global_options, key):
+                    setattr(self.global_options, key, value)
+
+            # Setup logging
+            if hasattr(self.global_options, 'verbose'):
+                self._setup_logging(self.global_options.verbose)
+
+        # Create function with dynamic signature
+        callback_impl.__signature__ = inspect.Signature(params)
+        self.app.callback(invoke_without_command=True)(callback_impl)
+
+    def _setup_logging(self, verbose: int):
+        """Setup logging based on verbosity level."""
+        level_map = {
+            0: logging.ERROR,
+            1: logging.WARNING,
+            2: logging.INFO,
+            3: logging.DEBUG
+        }
+        level = level_map.get(verbose, logging.DEBUG)
+        logging.basicConfig(
+            level=level,
+            stream=sys.stderr,
+            format='%(levelname)s: %(message)s'
+        )
+
+    def _extract_file_arg(self) -> Optional[str]:
+        """Extract file argument from command line - simple positional before any commands."""
+        args = sys.argv[1:]
+
+        for i, arg in enumerate(args):
+            if not arg.startswith('-') and ('.' in arg or '/' in arg or os.path.exists(arg)):
+                # Remove file arg from sys.argv so Typer doesn't see it
+                sys.argv.pop(i + 1)  # +1 because sys.argv includes script name
+                return arg
+        return None
+
+    def _get_app_instance(self) -> Any:
+        """Get or create application instance with file loaded and options applied generically."""
+        if self.app_instance is None:
+            self.app_instance = self.app_class()
+
+            # Load file if needed - generic file loading
+            if self.needs_file_input and hasattr(self, 'file_path') and self.file_path:
+                if hasattr(self.app_instance, 'load_data'):
+                    self.app_instance.load_data(self.file_path)
+
+        # Apply common options generically using reflection
+        for field_name, field in self.common_options_class.__dataclass_fields__.items():
+            option_value = getattr(self.global_options, field_name)
+            setter_method = f'set_{field_name}'
+
+            if hasattr(self.app_instance, setter_method):
+                getattr(self.app_instance, setter_method)(option_value)
+
+        return self.app_instance
+
+    def _handle_exceptions(self, func: Callable) -> Callable:
+        """Decorator to handle exceptions - ALWAYS show full stacks for developers."""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except CLIError as e:
+                # Show the error message but also the full stack trace
+                self.console.print(f"[bold red]CLI Error:[/bold red] {e.message}")
+                self.console.print(Panel(
+                    Text(traceback.format_exc(), style="red"),
+                    title="[bold red]Full Stack Trace[/bold red]",
+                    border_style="red"
+                ))
+                raise Exit(code=e.exit_code)
+            except Exception as e:
+                # ALWAYS show full traceback for developers
+                self.console.print(Panel(
+                    Text(traceback.format_exc(), style="red"),
+                    title="[bold red]Exception Stack Trace[/bold red]",
+                    border_style="red"
+                ))
+                raise Exit(code=1)
+        return wrapper
+
+    def command(self, name: str, method_name: str = None):
+        """Register a command that calls an app method and renders response."""
+        def decorator(func: Callable):
+            @self._handle_exceptions
+            def wrapper(**kwargs):
+                app_instance = self._get_app_instance()
+
+                # Extract common option names
+                common_option_names = set(self.common_options_class.__dataclass_fields__.keys())
+
+                # Split kwargs into common options and method args
+                method_kwargs = {k: v for k, v in kwargs.items() if k not in common_option_names}
+                common_kwargs = {k: v for k, v in kwargs.items() if k in common_option_names}
+
+                # Call the app method
+                app_method_name = method_name or name
+                if hasattr(app_instance, app_method_name):
+                    app_method = getattr(app_instance, app_method_name)
+                    response = app_method(**method_kwargs)
+                else:
+                    raise ValueError(f"Application has no method '{app_method_name}'")
+
+                # Render response if present using smart format detection
+                if response is not None:
+                    # Create options object for renderer from command-level options
+                    render_options = self.common_options_class()
+                    for key, value in common_kwargs.items():
+                        setattr(render_options, key, value)
+
+                    # Use command-level format if provided, otherwise fall back to global
+                    effective_format = render_options.format or self.global_options.format
+                    renderer = OutputRenderer(self.console, effective_format, render_options)
+                    renderer.render(response)
+
+                return response
+
+            # Create clean signature for Typer (only non-common options)
+            orig_sig = inspect.signature(func)
+            clean_params = []
+
+            for param_name, param in orig_sig.parameters.items():
+                if param_name not in ['app'] and param_name not in self.common_options_class.__dataclass_fields__:
+                    clean_params.append(param)
+
+            # Add common options to signature
+            for field_name, field in self.common_options_class.__dataclass_fields__.items():
+                option_args = field.metadata.get('option', [f'--{field_name}'])
+                help_text = field.metadata.get('help', '')
+                default_val = field.default if field.default != field.default_factory else field.default_factory()
+
+                param = inspect.Parameter(
+                    field_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=Option(default_val, *option_args, help=help_text),
+                    annotation=field.type
+                )
+                clean_params.append(param)
+
+            wrapper.__signature__ = inspect.Signature(clean_params)
+            wrapper.__name__ = func.__name__
+            wrapper.__doc__ = func.__doc__
+
+            return self.app.command(name)(wrapper)
+        return decorator
+
+    def subcommand_group(self, name: str, help_text: str = None) -> 'TyperCommonOptions':
+        """Create a subcommand group."""
+        subapp = typer.Typer(help=help_text or f"{name} commands")
+        self.app.add_typer(subapp, name=name)
+
+        # Create a new wrapper for the subcommand group sharing state
+        sub_wrapper = TyperCommonOptions.__new__(TyperCommonOptions)
+        sub_wrapper.console = self.console
+        sub_wrapper.app = subapp
+        sub_wrapper.app_class = self.app_class
+        sub_wrapper.app_instance = self.app_instance  # Share instance
+        sub_wrapper.needs_file_input = self.needs_file_input
+        sub_wrapper.common_options_class = self.common_options_class
+        sub_wrapper.global_options = self.global_options  # Share global state
+        if hasattr(self, 'file_path'):
+            sub_wrapper.file_path = self.file_path
+        return sub_wrapper
+
+    def run(self):
+        """Run the Typer application."""
+        self.app()
+
 
 # --- Abbreviation Logic (Internal) ---
 
@@ -41,8 +470,8 @@ CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CACHE_DIR = Path.home() / ".cache" / APP_NAME
 
 @dataclass
-class AppConfig:
-    """Application configuration."""
+class DataAppConfig:
+    """Data application configuration."""
     output_format: str = "table"
     verbose: int = 1
 
@@ -64,7 +493,7 @@ class FileConfig:
 @dataclass
 class AppState:
     """Application state."""
-    config: AppConfig = field(default_factory=AppConfig)
+    config: DataAppConfig = field(default_factory=DataAppConfig)
     df: Optional[pd.DataFrame] = None
     file_path: Optional[Path] = None
     content_hash: Optional[str] = None
@@ -72,11 +501,10 @@ class AppState:
     short_name_map: Dict[str, str] = field(default_factory=dict)
 
 
-class Application:
-    """Main application class."""
+class DataApplication:
+    """Main application class with business logic separated from CLI concerns."""
 
-    def __init__(self, typer_app: TyperDI):
-        self.typer = typer_app
+    def __init__(self):
         self.state = AppState()
         self.console = Console()
         self._setup()
@@ -85,19 +513,14 @@ class Application:
         """Initial setup for config and cache directories."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self._setup_logging()
 
-    def _setup_logging(self):
-        """Sets up logging based on verbosity."""
-        level = logging.WARNING
-        if self.state.config.verbose == 0:
-            level = logging.ERROR
-        elif self.state.config.verbose == 2:
-            level = logging.INFO
-        elif self.state.config.verbose >= 3:
-            level = logging.DEBUG
+    def set_output_format(self, format: str):
+        """Set the output format."""
+        self.state.config.output_format = format
 
-        logging.basicConfig(level=level, stream=sys.stderr, format='%(levelname)s: %(message)s')
+    def set_verbosity(self, verbose: int):
+        """Set the verbosity level."""
+        self.state.config.verbose = verbose
 
     def get_content_hash(self, file_path: Path) -> str:
         """Computes the SHA1 hash of the file's content."""
@@ -134,7 +557,6 @@ class Application:
             json.dump(config_dict, f, indent=2)
         logging.info(f"Saved file config to {config_path}")
 
-
     def _generate_aliases(self, df: pd.DataFrame, base_aliases: Optional[Dict[str, FieldAlias]] = None):
         """Generates and stores unique short names for fields."""
         aliases: Dict[str, FieldAlias] = base_aliases if base_aliases is not None else {}
@@ -169,7 +591,6 @@ class Application:
         self.state.file_config.fields = aliases
         self.save_file_config()
 
-
     def _apply_computed_fields(self):
         """Applies computed field expressions to the DataFrame in dependency order."""
         if self.state.df is None or not self.state.file_config.computed:
@@ -203,9 +624,7 @@ class Application:
 
         if len(eval_order) < len(computed_names):
             cycle_nodes = sorted(list(computed_names - set(eval_order)))
-            self.console.print("[bold red]Error:[/bold red] Circular dependency detected in computed fields.")
-            self.console.print(f"[bold red]Problematic fields:[/bold red] {', '.join(cycle_nodes)}")
-            raise Exit(code=1)
+            raise ApplicationError(f"Circular dependency detected in computed fields: {', '.join(cycle_nodes)}")
 
         # Evaluate expressions in order
         for name in eval_order:
@@ -215,7 +634,7 @@ class Application:
                 self.state.df[name] = self.state.df.eval(translated_expression, engine='python')
                 logging.info(f"Applied computed field '{name}' with expression: {expression}")
             except Exception as e:
-                self.console.print(f"[bold yellow]Warning:[/bold yellow] Could not compute field '{name}': {e}")
+                logging.warning(f"Could not compute field '{name}': {e}")
                 if name in self.state.df.columns:
                     del self.state.df[name]
 
@@ -242,17 +661,15 @@ class Application:
                 # Computed fields are referenced by their name, which becomes a column name
                 translated_expression = translated_expression.replace(f'{{{name}}}', f'`{name}`')
             else:
-                raise ValueError(f"Field name or alias '{{{name}}}' not found.")
+                raise ValidationError(f"Field name or alias '{{{name}}}' not found.")
 
         return translated_expression
-
 
     def load_data(self, file_path_str: str):
         """Loads data from a file, using cache if available."""
         file_path = Path(file_path_str)
         if not file_path.exists():
-            self.console.print(f"[bold red]Error:[/bold red] File not found at {file_path_str}")
-            raise Exit(code=1)
+            raise FileNotFoundError(file_path_str)
 
         self.state.file_path = file_path
         self.state.content_hash = self.get_content_hash(file_path)
@@ -276,14 +693,13 @@ class Application:
                 elif file_ext == '.csv':
                     self.state.df = pd.read_csv(file_path)
                 else:
-                    raise ValueError(f"Unsupported file type: {file_ext}")
+                    raise ApplicationError(f"Unsupported file type: {file_ext}")
 
                 with open(cache_path, 'wb') as f:
                     pickle.dump(self.state.df, f)
                 logging.info(f"Cached data to {cache_path}")
             except Exception as e:
-                self.console.print(f"[bold red]Error loading file:[/bold red] {e}")
-                raise Exit(code=1)
+                raise ApplicationError(f"Error loading file: {e}")
 
         # Load or generate aliases
         if config_path.exists():
@@ -316,12 +732,36 @@ class Application:
         # Re-create the map in case computed fields added new aliases.
         self.state.short_name_map = {v.short_name: k for k, v in self.state.file_config.fields.items()}
 
+    def _match_field_pattern(self, pattern: str) -> List[str]:
+        """
+        Matches field names and aliases using wildcard patterns (* and ?).
+        Returns a list of actual column names that match the pattern.
+        """
+        if self.state.df is None:
+            return []
+
+        matched_columns = []
+        all_columns = list(self.state.df.columns)
+        all_aliases = list(self.state.short_name_map.keys())
+
+        # Check if pattern matches any column names directly
+        for col in all_columns:
+            if fnmatch.fnmatch(col, pattern):
+                matched_columns.append(col)
+
+        # Check if pattern matches any aliases, and resolve to column names
+        for alias in all_aliases:
+            if fnmatch.fnmatch(alias, pattern):
+                resolved_field = self.state.short_name_map[alias]
+                if resolved_field not in matched_columns:
+                    matched_columns.append(resolved_field)
+
+        return matched_columns
 
     def get_schema(self) -> Optional[Dict[str, FieldAlias]]:
         """Gets the schema of the loaded DataFrame."""
         if self.state.df is None:
-            self.console.print("[bold red]No data loaded.[/bold red]")
-            return None
+            raise ApplicationError("No data loaded.")
         return self.state.file_config.fields
 
     def filter_data(self, query: str) -> Optional[pd.DataFrame]:
@@ -331,8 +771,7 @@ class Application:
         e.g. 'first-name/^A/,last-name'
         """
         if self.state.df is None:
-            self.console.print("[bold red]No data loaded.[/bold red]")
-            return None
+            raise ApplicationError("No data loaded.")
 
         display_columns = []
         filters = []
@@ -370,18 +809,34 @@ class Application:
                                 value = parts[1]
                                 break
 
-                # Resolve alias to original field name
-                resolved_field = self.state.short_name_map.get(field_name_or_alias, field_name_or_alias)
+                # Check if field name contains wildcards
+                if '*' in field_name_or_alias or '?' in field_name_or_alias:
+                    # Handle wildcard patterns
+                    matched_fields = self._match_field_pattern(field_name_or_alias)
+                    if not matched_fields:
+                        raise ValidationError(f"No fields match pattern: {field_name_or_alias}")
 
-                if resolved_field not in self.state.df.columns:
-                    self.console.print(f"[bold red]Invalid field name or alias:[/bold red] {field_name_or_alias}")
-                    return None
+                    # Add all matched fields to display columns
+                    for matched_field in matched_fields:
+                        if matched_field not in display_columns:
+                            display_columns.append(matched_field)
 
-                if resolved_field not in display_columns:
-                    display_columns.append(resolved_field)
+                    # If there's an operator, apply it to all matched fields
+                    if operator:
+                        for matched_field in matched_fields:
+                            filters.append((matched_field, operator.strip(), value.strip()))
+                else:
+                    # Handle exact field name or alias
+                    resolved_field = self.state.short_name_map.get(field_name_or_alias, field_name_or_alias)
 
-                if operator:
-                    filters.append((resolved_field, operator.strip(), value.strip()))
+                    if resolved_field not in self.state.df.columns:
+                        raise ValidationError(f"Invalid field name or alias: {field_name_or_alias}")
+
+                    if resolved_field not in display_columns:
+                        display_columns.append(resolved_field)
+
+                    if operator:
+                        filters.append((resolved_field, operator.strip(), value.strip()))
 
             if has_wildcard:
                 all_columns = list(self.state.df.columns)
@@ -398,8 +853,7 @@ class Application:
                         mask = filtered_df[field].str.contains(val, regex=True, na=False)
                         filtered_df = filtered_df[mask]
                     else:
-                        self.console.print(f"[bold red]Error:[/bold red] Regex filter '~' can only be applied to string columns. '{field}' is not a string type.")
-                        return None
+                        raise ValidationError(f"Regex filter '~' can only be applied to string columns. '{field}' is not a string type.")
                 elif op in ['>=', '<=', '>', '<', '=']:
                     # Attempt to convert value to number for comparison
                     try:
@@ -410,8 +864,7 @@ class Application:
                             mask = filtered_df[field].astype(str) == val
                             filtered_df = filtered_df[mask]
                             continue
-                        self.console.print(f"[bold red]Error:[/bold red] Operator '{op}' requires a numeric value for comparison (e.g., 'score>5').")
-                        return None
+                        raise ValidationError(f"Operator '{op}' requires a numeric value for comparison (e.g., 'score>5').")
 
                     if pd.api.types.is_numeric_dtype(filtered_df[field]):
                         col = pd.to_numeric(filtered_df[field])
@@ -422,202 +875,157 @@ class Application:
                         elif op == '<=': mask = col <= numeric_val
                         filtered_df = filtered_df[mask]
                     else:
-                        self.console.print(f"[bold red]Error:[/bold red] Cannot apply numeric comparison '{op}' on non-numeric column '{field}'.")
-                        return None
+                        raise ValidationError(f"Cannot apply numeric comparison '{op}' on non-numeric column '{field}'.")
                 else:
-                    self.console.print(f"[bold red]Unsupported operator:[/bold red] {op}")
-                    return None
+                    raise ValidationError(f"Unsupported operator: {op}")
 
             # Return the filtered DataFrame with only the specified columns
             return filtered_df[display_columns]
 
-        except ValueError as e:
-            self.console.print(f"[bold red]Invalid query:[/bold red] {e}")
-            return None
         except re.error as e:
-            self.console.print(f"[bold red]Invalid regex pattern:[/bold red] {e}")
-            return None
+            raise ValidationError(f"Invalid regex pattern: {e}")
 
-# --- CLI ---
+    # --- Business Logic Methods ---
 
-app = Application(
-    TyperDI(
-        help="A miller-style CLI for querying tabular data.",
-        context_settings={"help_option_names": ["--help", "-h"], "allow_interspersed_args": False}
-    )
-)
-# No callback. Typer will handle the help message.
+    def show_schema(self) -> SchemaResponse:
+        """Get the schema of the data file."""
+        schema_data = self.get_schema()
+        if not schema_data:
+            raise ApplicationError("No schema data available")
 
-def common_options(
-    format: Optional[str] = Option(None, "--format", "-f", help="Output format (table, json)."),
-    verbose: int = Option(1, "--verbose", "-v", help="Verbosity (0-3)."),
-):
-    """Dependency for common options."""
-    app.state.config.verbose = verbose
-    app._setup_logging()
-
-    if format:
-        app.state.config.output_format = format
-    elif not sys.stdout.isatty():
-        app.state.config.output_format = "json"
-
-    return app
-
-
-@app.typer.command("schema")
-def schema(
-    app_instance: Application = Depends(common_options)
-):
-    """Display the schema of the data file."""
-    if app_instance.state.df is None:
-        app.console.print("[bold red]Error:[/bold red] File path must be provided before the command.")
-        raise Exit(code=1)
-
-    schema_data = app_instance.get_schema()
-    if schema_data:
         # Sort by cid for consistent order
         sorted_aliases = sorted(schema_data.items(), key=lambda item: item[1].cid)
 
-        if app_instance.state.config.output_format == 'json':
-            # Create a JSON-friendly representation
-            json_output = {
-                "fields": {
-                    name: {
-                        "cid": alias.cid,
-                        "short_name": alias.short_name,
-                        "dtype": alias.dtype
-                    } for name, alias in sorted_aliases
-                },
-                "computed": app.state.file_config.computed
-            }
-            app_instance.console.print_json(data=json_output)
+        fields = [
+            FieldInfo(
+                cid=alias.cid,
+                name=name,
+                short_name=alias.short_name,
+                dtype=alias.dtype
+            )
+            for name, alias in sorted_aliases
+        ]
+
+        return SchemaResponse(
+            fields=fields,
+            computed_fields=self.state.file_config.computed,
+            file_name=self.state.file_path.name
+        )
+
+    def filter_records(self, query: str) -> FilterResponse:
+        """Filter records and return the results."""
+        result_df = self.filter_data(query)
+        if result_df is None:
+            raise ApplicationError("Failed to filter data")
+
+        records = [dict(row) for _, row in result_df.iterrows()]
+
+        return FilterResponse(records=records)
+
+    def list_tags(self) -> TagListResponse:
+        """List all computed fields (tags)."""
+        computed_fields = self.state.file_config.computed
+
+        tags = [
+            TagInfo(name=name, expression=expr)
+            for name, expr in computed_fields.items()
+        ]
+
+        return TagListResponse(tags=tags)
+
+    def set_tag(self, field_name: str, expression: str) -> TagSetResponse:
+        """Set a computed field (tag) with a pandas expression."""
+        try:
+            # Validate expression by trying to apply it
+            translated_expression = self._translate_expression(expression)
+            self.state.df.eval(translated_expression, engine='python')
+
+            self.state.file_config.computed[field_name] = expression
+            self.save_file_config()
+
+            return TagSetResponse(
+                field_name=field_name,
+                success=True,
+                message=f"Tag '{field_name}' set successfully."
+            )
+        except Exception as e:
+            return TagSetResponse(
+                field_name=field_name,
+                success=False,
+                message=f"Failed to set tag '{field_name}': {e}"
+            )
+
+    def unset_tag(self, field_name: str) -> TagUnsetResponse:
+        """Remove a computed field (tag)."""
+        if field_name in self.state.file_config.computed:
+            del self.state.file_config.computed[field_name]
+
+            # also remove from fields if it exists
+            if field_name in self.state.file_config.fields:
+                del self.state.file_config.fields[field_name]
+
+            self.save_file_config()
+            return TagUnsetResponse(
+                field_name=field_name,
+                success=True,
+                message=f"Tag '{field_name}' unset successfully."
+            )
         else:
-            table = Table(title=f"Schema for {app_instance.state.file_path.name}")
-            table.add_column("CID", style="yellow")
-            table.add_column("Field Name", style="cyan")
-            table.add_column("Short Name", style="green")
-            table.add_column("Data Type", style="magenta")
-            for name, alias in sorted_aliases:
-                table.add_row(str(alias.cid), name, alias.short_name, alias.dtype)
-            app_instance.console.print(table)
-
-            if app_instance.state.file_config.computed:
-                computed_table = Table(title="Computed Fields (Tags)")
-                computed_table.add_column("Tag Name", style="cyan")
-                computed_table.add_column("Expression", style="green")
-                for name, expr in app_instance.state.file_config.computed.items():
-                    computed_table.add_row(name, expr)
-                app_instance.console.print(computed_table)
-
-@app.typer.command("flt")
-def flt(
-    query: str = Argument(..., help="Filter query, comma-separated (e.g., 'first-name/^A/,score>5')"),
-    app_instance: Application = Depends(common_options)
-):
-    """Filter records and display specified columns."""
-    if app_instance.state.df is None:
-        app.console.print("[bold red]Error:[/bold red] File path must be provided before the command.")
-        raise Exit(code=1)
-
-    result_df = app_instance.filter_data(query)
-    # logging.debug(f"Filtered DataFrame:\n{result_df}")
-    if result_df is not None:
-        if app_instance.state.config.output_format == 'json':
-            app_instance.console.print(result_df.to_json(orient='records', indent=2))
-        else:
-            if result_df.empty:
-                app_instance.console.print("[yellow]No records found matching the query.[/yellow]")
-                return
-
-            # print(result_df) # Temporary print for debugging
-
-            table = Table(title="Filtered Results", expand=True)
-            for col in result_df.columns:
-                table.add_column(col, style="cyan", no_wrap=True)
-            for _, row in result_df.iterrows():
-                table.add_row(*[str(item) for item in row])
-            app_instance.console.print(table)
+            return TagUnsetResponse(
+                field_name=field_name,
+                success=False,
+                message=f"Tag '{field_name}' not found."
+            )
 
 
-@app.typer.command("tag-ls")
-def tag_ls(
-    app_instance: Application = Depends(common_options)
-):
-    """List all computed fields (tags)."""
-    if app_instance.state.df is None:
-        app.console.print("[bold red]Error:[/bold red] File path must be provided before the command.")
-        raise Exit(code=1)
+# --- CLI Command Handlers ---
 
-    computed_fields = app_instance.state.file_config.computed
-    if not computed_fields:
-        app_instance.console.print("[yellow]No computed fields (tags) found.[/yellow]")
-        return
+def create_cli():
+    """Create and configure the CLI application."""
+    cli = TyperCommonOptions("A CLI for querying tabular data.", DataApplication)
 
-    table = Table(title="Computed Fields (Tags)")
-    table.add_column("Tag Name", style="cyan")
-    table.add_column("Expression", style="green")
+    # Main commands - proper method calls
+    @cli.command("schema", "show_schema")
+    def schema_cmd(app: DataApplication):
+        """Display the schema of the data file."""
+        return app.show_schema()
 
-    for name, expr in computed_fields.items():
-        table.add_row(name, expr)
+    @cli.command("flt", "filter_records")
+    def flt_cmd(
+        app: DataApplication,
+        query: str = Argument(..., help="Filter query, comma-separated (e.g., 'first-name/^A/,score>5')"),
+    ):
+        """Filter records and display specified columns."""
+        return app.filter_records(query)
 
-    app_instance.console.print(table)
+    # Tag subcommands
+    tag_cli = cli.subcommand_group("tag", "Commands for managing computed fields (tags)")
 
+    @tag_cli.command("ls", "list_tags")
+    def tag_ls_cmd(app: DataApplication):
+        """List all computed fields (tags)."""
+        return app.list_tags()
 
-@app.typer.command("tag-set")
-def tag_set(
-    field_name: str = Argument(..., help="The name of the new computed field."),
-    expression: str = Argument(..., help="The pandas expression to compute the field."),
-    app_instance: Application = Depends(common_options)
-):
-    """Set a computed field (tag) with a pandas expression."""
-    if app_instance.state.df is None:
-        app.console.print("[bold red]Error:[/bold red] File path must be provided before the command.")
-        raise Exit(code=1)
+    @tag_cli.command("set", "set_tag")
+    def tag_set_cmd(
+        app: DataApplication,
+        field_name: str = Argument(..., help="The name of the new computed field."),
+        expression: str = Argument(..., help="The pandas expression to compute the field."),
+    ):
+        """Set a computed field (tag) with a pandas expression."""
+        return app.set_tag(field_name, expression)
 
-    # Validate expression by trying to apply it
-    try:
-        translated_expression = app_instance._translate_expression(expression)
-        app_instance.state.df.eval(translated_expression, engine='python')
-    except Exception as e:
-        app.console.print(f"[bold red]Invalid expression:[/bold red] {e}")
-        raise Exit(code=1)
+    @tag_cli.command("unset", "unset_tag")
+    def tag_unset_cmd(
+        app: DataApplication,
+        field_name: str = Argument(..., help="The name of the computed field to remove."),
+    ):
+        """Remove a computed field (tag)."""
+        return app.unset_tag(field_name)
 
-    app_instance.state.file_config.computed[field_name] = expression
-    app_instance.save_file_config()
-    app.console.print(f"[green]Tag '{field_name}' set successfully.[/green]")
-
-
-@app.typer.command("tag-unset")
-def tag_unset(
-    field_name: str = Argument(..., help="The name of the computed field to remove."),
-    app_instance: Application = Depends(common_options)
-):
-    """Remove a computed field (tag)."""
-    if app_instance.state.df is None:
-        app.console.print("[bold red]Error:[/bold red] File path must be provided before the command.")
-        raise Exit(code=1)
-
-    if field_name in app_instance.state.file_config.computed:
-        del app_instance.state.file_config.computed[field_name]
-
-        # also remove from fields if it exists
-        if field_name in app_instance.state.file_config.fields:
-            del app_instance.state.file_config.fields[field_name]
-
-        app_instance.save_file_config()
-        app.console.print(f"[green]Tag '{field_name}' unset successfully.[/green]")
-    else:
-        app.console.print(f"[bold yellow]Warning:[/bold yellow] Tag '{field_name}' not found.")
-        raise Exit(code=2)
+    return cli
 
 
 if __name__ == "__main__":
-    COMMANDS = {"schema", "flt", "tag-set", "tag-unset", "tag-ls", "--help", "-h"}
-
-    # Pre-process sys.argv to "shift" the file argument out
-    if len(sys.argv) > 1 and sys.argv[1] not in COMMANDS:
-        file_path = sys.argv.pop(1)
-        # The app.load_data method will handle errors and exit if the file is invalid
-        app.load_data(file_path)
-
-    app.typer()
+    cli = create_cli()
+    cli.run()

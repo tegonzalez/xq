@@ -4,11 +4,13 @@ XQ is a command-line tool for performing read-only queries on structured data fi
 
 ## Features
 
-- **File Support**: Works with Excel (`.xlsx`), JSON, and CSV files.
+- **File Support**: Works with Excel (`.xlsx`), JSON (`.json`), and CSV (`.csv`) files.
 - **Schema Inspection**: Quickly view column names, their data types, and generated short-name aliases.
-- **Powerful Filtering**: A simple yet powerful query language to filter records.
+- **Powerful Filtering**: A simple query language to filter records.
+- **Wildcard Field Selection**: Use `*` and `?` patterns to match multiple fields at once.
 - **Smart Caching**: Caches processed data and field name configurations for fast subsequent loads.
-- **Flexible Output**: Display results as a clean, human-readable table (default) or as JSON for programmatic use.
+- **Flexible Output**: Automatic format detection based on terminal type, with manual override options.
+- **Computed Fields**: Create derived columns with custom expressions using existing field data.
 
 ## Installation
 
@@ -25,7 +27,35 @@ The basic invocation pattern is:
 
 ```bash
 ./xq.py --help
-./xq.py <path_to_file> <command> [arguments...]
+./xq.py [global_options] <path_to_file> <command> [command_options] [arguments...]
+```
+
+### Global+Command Options
+
+| Option | Short | Description | Default |
+|:-------|:------|:------------|:--------|
+| `--format`  | `-f` | Output format (`table` or `json`) | Auto-detected based on TTY |
+| `--verbose` | `-v` | Verbosity level (0-3) | 1 |
+
+### Output Format Determination
+
+XQ detects tty before outputting rich table format:
+
+- **Interactive Terminal (TTY)**: Uses rich table format with colors and formatting
+- **Non-TTY/Pipes**: Automatically switches to JSON format for programmatic use
+- **Manual Override**: Use `--format` to explicitly set `table` or `json` format
+
+Examples:
+```bash
+# Interactive use - shows rich table
+./xq.py data.csv schema
+
+# Piped output - automatically uses JSON
+./xq.py data.csv flt "status=active,email" | cat
+
+# Force JSON format even in terminal
+./xq.py -f json data.csv schema
+./xq.py data.csv schema -f json
 ```
 
 ### Home Folder Storage
@@ -46,7 +76,7 @@ Displays the data schema, including column IDs (CID), full field names, generate
 **Usage:**
 
 ```bash
-python xq.py path/to/your/data.xlsx schema
+./xq.py path/to/your/data.xlsx schema
 ```
 
 #### `flt`
@@ -56,20 +86,35 @@ Filters the data based on a query string and displays the results.
 **Usage:**
 
 ```bash
-python xq.py path/to/your/data.xlsx flt "query_string"
+./xq.py path/to/your/data.xlsx flt "query_string"
 ```
 
-### `tag-set`, `tag-unset`, `tag-ls`
+#### `tag ls`, `tag set`, `tag unset`
 
 Manage computed fields (tags) which are new columns derived from existing data.
 
--   `tag-set`: Creates a new or modifies an existing computed field.
--   `tag-unset`: Removes a computed field.
--   `tag-ls`: Lists all existing computed fields.
+-   `tag set`: Creates a new or modifies an existing computed field.
+-   `tag unset`: Removes a computed field.
+-   `tag ls`: Lists all existing computed fields.
+
+**Usage:**
+
+```bash
+# List all computed fields
+./xq.py data.csv tag ls
+
+# Create a new computed field
+./xq.py data.csv tag set total-cost "{price} * {qty}"
+
+# Remove a computed field
+./xq.py data.csv tag unset total-cost
+```
+
+### Computed Fields (Tags)
+
+When you create a computed field with `tag set`, you provide a name for the new field and an expression to calculate its value. This expression language is designed to be simple and intuitive, allowing you to reference other columns by their short names.
 
 #### Tag Expression Language
-
-When you create a computed field with `tag-set`, you provide a name for the new field and an expression to calculate its value. This expression language is designed to be simple and intuitive, allowing you to reference other columns by their short names.
 
 **Syntax:**
 
@@ -88,60 +133,188 @@ Let's assume you have the following fields and short names:
 1.  **Calculate Total Cost**: Create a new field `total-cost` by multiplying `unit-price` and `quantity`.
 
     ```bash
-    python xq.py data.csv tag-set total-cost "{price} * {qty}"
+    ./xq.py data.csv tag set total-cost "{price} * {qty}"
     ```
 
 2.  **Calculate Price with Tax**: Create a `final-price` field that includes tax.
 
     ```bash
-    python xq.py data.csv tag-set final-price "{price} * (1 + {tax})"
+    ./xq.py data.csv tag set final-price "{price} * (1 + {tax})"
     ```
 
 3.  **Conditional Logic (Future)**: *While not yet implemented, the language is designed to be extended with more complex logic, such as conditional statements.*
 
     ```bash
     # (Example of a possible future enhancement)
-    # python xq.py data.csv tag-set category "if {price} > 100 then 'premium' else 'standard'"
+    # ./xq.py data.csv tag set category "if {price} > 100 then 'premium' else 'standard'"
     ```
 
 This approach allows you to build powerful, readable expressions for data transformation directly from the command line.
 
-### Filter Query Language
+## Filter Query Language
 
-The filter query is a comma-separated string of expressions. Each expression can either be a **filter condition** or a **column name** to include in the output.
+The filter query is a comma-separated string of expressions. Each expression can be:
 
--   **Filter Conditions**: Apply a filter to the dataset.
--   **Column Names**: Specify a column to be included in the final output table.
+1. **A filter condition** - applies a filter to the dataset
+2. **A column name or alias** - includes the column in output
+3. **A wildcard pattern** - matches multiple columns using `*` and `?`
+4. **The special `*` wildcard** - includes all remaining columns
 
-All filter conditions are combined with a logical **AND**. The output columns will appear in the order they are listed in the query string.
+All filter conditions are combined with logical **AND**. Output columns appear in the order specified in the query string.
 
-#### Operators
+### Basic Syntax
+
+```
+field_expression[,field_expression,...]
+```
+
+Where each `field_expression` can be:
+- `field_name` - include column in output
+- `field_name operator value` - filter condition
+- `pattern*` - wildcard pattern matching
+- `*` - include all remaining columns
+
+### Operators
 
 | Operator | Description                                     | Example                                   |
 | :------- | :---------------------------------------------- | :---------------------------------------- |
-| `/.../`  | Shorthand for regex match                       | `'user-name/^A/'`                         |
+| `/.../`  | Shorthand for regex match                       | `'user-name/^A/'` or `'email/@gmail/'`   |
 | `=`      | Equal to (numeric or string)                    | `'status=active'` or `'zip-code=90210'`   |
 | `>`      | Greater than (numeric)                          | `'order-total>99.50'`                     |
 | `<`      | Less than (numeric)                             | `'age<30'`                                |
 | `>=`     | Greater than or equal to (numeric)              | `'score>=85'`                             |
 | `<=`     | Less than or equal to (numeric)                 | `'inventory<=10'`                         |
 
-#### Examples
+### Wildcard Field Selection
+
+XQ supports powerful wildcard patterns using standard shell globbing:
+
+- `*` - matches any number of characters
+- `?` - matches any single character
+- `*` as standalone - includes all remaining columns
+
+#### Wildcard Examples
+
+**Field Names:**
+```
+user-id, user-name, user-email, order-id, order-total, order-date
+```
+
+**Wildcard Queries:**
+
+1. **All user fields**: Select all columns starting with "user"
+   ```bash
+   ./xq.py data.csv flt "user-*"
+   ```
+
+2. **Mixed patterns**: Get user fields and any field ending with "total"
+   ```bash
+   ./xq.py data.csv flt "user-*,*-total"
+   ```
+
+3. **Filtered wildcards**: All user fields where order total > 100
+   ```bash
+   ./xq.py data.csv flt "user-*,order-total>100"
+   ```
+
+4. **Single character wildcards**: Fields like "user-a", "user-b", etc.
+   ```bash
+   ./xq.py data.csv flt "user-?"
+   ```
+
+5. **All remaining columns**: Show specific fields first, then everything else
+   ```bash
+   ./xq.py data.csv flt "user-id,user-name,*"
+   ```
+
+### Query Examples
+
+#### Basic Filtering
 
 -   **Simple Filter**: Show the `email` for all users whose `status` is 'active'.
 
     ```bash
-    python xq.py users.csv flt "status=active,email"
+    ./xq.py users.csv flt "status=active,email"
     ```
 
--   **Regex and Value Filter**: Show `first-name`, `last-name`, and `score` for all users whose first name starts with 'A' and whose score is greater than 80.
+-   **Numeric Filter**: Show users with scores greater than 80.
 
     ```bash
-    python xq.py users.xlsx flt "first-name/^A/,last-name,score>80"
+    ./xq.py users.xlsx flt "score>80,user-name,score"
     ```
 
--   **Display Columns Only**: Show only the `product-id` and `price` columns for all records, without any filtering. The special `*` fieldname can be used to include all other fields.
+#### Filtering
+
+-   **Shorthand Regex**: Show users whose first name starts with 'A'.
 
     ```bash
-    python xq.py inventory.json flt "product-id,price,*"
-    ``` 
+    ./xq.py users.csv flt "first-name/^A/,first-name,last-name"
+    ```
+
+-   **Email Domain Filter**: Find Gmail users.
+
+    ```bash
+    ./xq.py users.csv flt "email/@gmail/,user-name"
+    ```
+
+-   **Multiple Conditions**: First name starts with 'A' AND score > 80.
+
+    ```bash
+    ./xq.py users.xlsx flt "first-name/^A/,score>80,first-name,last-name,score"
+    ```
+
+-   **Combined Wildcard Selection**: All user fields for high-scoring users.
+
+    ```bash
+    ./xq.py users.csv flt "score>=90,user-*"
+    ```
+
+-   **Display All Columns**: Show all columns without filtering.
+
+    ```bash
+    ./xq.py inventory.json flt "*"
+    ```
+
+-   **Specific + Remaining**: Show key fields first, then everything else.
+
+    ```bash
+    ./xq.py inventory.json flt "product-id,price,*"
+    ```
+
+-   **Range Filtering**: Ages between 25 and 35.
+
+    ```bash
+    ./xq.py users.csv flt "age>=25,age<=35,user-name,age"
+    ```
+
+-   **Pattern Combinations**: User fields and order fields for active users.
+
+    ```bash
+    ./xq.py data.csv flt "status=active,user-*,order-*"
+    ```
+
+-   **Computed Field Filtering**: Using a computed field in queries.
+
+    ```bash
+    # First create the computed field
+    ./xq.py data.csv tag set total-with-tax "{price} * (1 + {tax})"
+    
+    # Then filter using it
+    ./xq.py data.csv flt "total-with-tax>50,product-name,total-with-tax"
+    ```
+
+### Error Handling
+
+XQ provides clear error messages for common issues:
+
+- **Invalid field names**: Clear indication of unrecognized fields
+- **Type mismatches**: Helpful messages when applying numeric operators to string fields
+- **Regex errors**: Specific feedback on malformed regular expressions
+- **No matches**: Informative message when wildcard patterns don't match any fields
+
+## Dependencies
+
+- `pandas>=2.2.2` - Data manipulation and analysis
+- `rich>=13.7.1` - Terminal formatting and tables
+- `typer-di>=0.1.3` - CLI framework
+- `openpyxl>=3.1.5` - Excel file support
