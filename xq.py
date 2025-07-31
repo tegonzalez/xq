@@ -564,7 +564,8 @@ class DataApplication:
 
         max_cid = -1
         if aliases:
-            max_cid = max(alias.cid for alias in aliases.values())
+            max_cid = max((alias.cid for alias in aliases.values() if alias.cid is not None), default=-1)
+
 
         for i, col_name in enumerate(df.columns):
             if col_name in aliases:
@@ -665,6 +666,73 @@ class DataApplication:
 
         return translated_expression
 
+    def _sniff_file_type(self, file_path: Path) -> str:
+        """Sniffs the file type by sampling content, ignoring comments."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content_sample = ""
+                for line in f:
+                    stripped_line = line.strip()
+                    if stripped_line and not stripped_line.startswith('#'):
+                        content_sample += stripped_line
+                    if len(content_sample) > 1024:
+                        break
+
+            # Primitive regex checks for JSON
+            # Check for object start or array start
+            if re.match(r'^\s*\{', content_sample) or re.match(r'^\s*\[', content_sample):
+                 return 'json'
+            # Check for CSV - look for comma-separated values in multiple lines
+            if len(content_sample.splitlines()) > 1 and all(',' in line for line in content_sample.splitlines()[:2]):
+                 return 'csv'
+
+        except (IOError, UnicodeDecodeError):
+            pass # Fallback to extension check
+
+        return 'unknown'
+
+    def _transform_json_generically(self, data: Any) -> pd.DataFrame:
+        """
+        Transforms a parsed JSON object (list or dict) into a single DataFrame.
+        - If dict of lists, it flattens it, adding a 'source_table' column.
+        - If list, it loads directly.
+        """
+        if isinstance(data, list):
+            # Standard case: list of records
+            return pd.DataFrame(data)
+        elif isinstance(data, dict):
+            # Case: dict of lists of records, potentially with non-uniform schemas
+            is_dict_of_lists = all(isinstance(v, list) for v in data.values())
+            if not is_dict_of_lists:
+                raise ApplicationError("Unsupported JSON structure. If root is a dictionary, all its values must be lists of objects.")
+
+            # First pass: collect all possible field names from all records
+            all_field_names = set()
+            for records in data.values():
+                for record in records:
+                    if isinstance(record, dict):
+                        all_field_names.update(record.keys())
+
+            # Add our own 'source_table' to the set of fields
+            all_field_names.add('source_table')
+
+            # Second pass: build the list of records, ensuring all fields are present
+            all_records = []
+            for source_table, records in data.items():
+                for record in records:
+                    if isinstance(record, dict):
+                        # Create a new record with all possible fields, initialized to None
+                        new_record = {field: None for field in all_field_names}
+                        # Update with actual values from the current record
+                        new_record.update(record)
+                        # Set the source table
+                        new_record['source_table'] = source_table
+                        all_records.append(new_record)
+            return pd.DataFrame(all_records)
+
+        # If the structure is not recognized, raise an error
+        raise ApplicationError("Unsupported JSON structure. Expecting a list of objects or a dictionary of lists of objects.")
+
     def load_data(self, file_path_str: str):
         """Loads data from a file, using cache if available."""
         file_path = Path(file_path_str)
@@ -684,16 +752,20 @@ class DataApplication:
                 self.state.df = pickle.load(f)
         else:
             logging.info(f"Loading data from {file_path}")
-            file_ext = file_path.suffix.lower()
             try:
+                file_ext = file_path.suffix.lower()
+                file_type = self._sniff_file_type(file_path)
+
                 if file_ext == '.xlsx':
                     self.state.df = pd.read_excel(file_path)
-                elif file_ext == '.json':
-                    self.state.df = pd.read_json(file_path)
-                elif file_ext == '.csv':
+                elif file_type == 'json' or file_ext == '.json':
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        json_data = json.load(f)
+                    self.state.df = self._transform_json_generically(json_data)
+                elif file_type == 'csv' or file_ext == '.csv':
                     self.state.df = pd.read_csv(file_path)
                 else:
-                    raise ApplicationError(f"Unsupported file type: {file_ext}")
+                    raise ApplicationError(f"Unsupported or unrecognized file type: {file_ext}")
 
                 with open(cache_path, 'wb') as f:
                     pickle.dump(self.state.df, f)
@@ -721,7 +793,8 @@ class DataApplication:
                 )
         else:
             logging.info("Generating new field aliases.")
-            self._generate_aliases(self.state.df)
+            if self.state.df is not None:
+                self._generate_aliases(self.state.df)
 
         # Create a reverse map for expression translation and filtering.
         self.state.short_name_map = {v.short_name: k for k, v in self.state.file_config.fields.items()}
