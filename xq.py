@@ -97,6 +97,26 @@ class TagUnsetResponse:
     success: bool
     message: str
 
+@dataclass
+class CacheItem:
+    """Information about a single cache item."""
+    hash_full: str
+    file_size: int
+    target_file: str
+
+@dataclass
+class CacheListResponse:
+    """Response DTO for cache list command."""
+    cache_items: List[CacheItem]
+
+@dataclass
+class CacheCleanResponse:
+    """Response DTO for cache clean command."""
+    target_file: str
+    success: bool
+    message: str
+    cleaned_ids: List[str]
+
 class CLIError(Exception):
     """Base exception for CLI errors."""
     def __init__(self, message: str, exit_code: int = 1):
@@ -168,6 +188,10 @@ class OutputRenderer:
             self._render_tag_list_table(response)
         elif isinstance(response, (TagSetResponse, TagUnsetResponse)):
             self._render_tag_operation_result(response)
+        elif isinstance(response, CacheListResponse):
+            self._render_cache_list_table(response)
+        elif isinstance(response, CacheCleanResponse):
+            self._render_cache_clean_result(response)
         else:
             self.console.print(f"[yellow]Unknown response type: {type(response)}[/yellow]")
 
@@ -232,6 +256,40 @@ class OutputRenderer:
         else:
             self.console.print(f"[red]{response.message}[/red]")
 
+    def _render_cache_list_table(self, response: CacheListResponse) -> None:
+        """Render cache list response as table."""
+        if not response.cache_items:
+            self.console.print("[yellow]No cache items found.[/yellow]")
+            return
+
+        table = Table(title="Cache Items")
+        table.add_column("Sha1", style="cyan")
+        table.add_column("Size (bytes)", style="yellow", justify="right")
+        table.add_column("Target File", style="green")
+
+        for item in response.cache_items:
+            # Format file size for readability
+            if item.file_size >= 1024 * 1024:
+                size_str = f"{item.file_size / (1024 * 1024):.1f}M"
+            elif item.file_size >= 1024:
+                size_str = f"{item.file_size / 1024:.1f}K"
+            else:
+                size_str = str(item.file_size)
+
+            table.add_row(item.hash_full, size_str, item.target_file)
+
+        self.console.print(table)
+
+    def _render_cache_clean_result(self, response: CacheCleanResponse) -> None:
+        """Render cache clean operation result."""
+        if response.success:
+            self.console.print(f"[green]{response.message}[/green]")
+            if response.cleaned_ids:
+                for cleaned_id in response.cleaned_ids:
+                    self.console.print(f"  [dim]Cleaned cache ID: {cleaned_id}[/dim]")
+        else:
+            self.console.print(f"[red]{response.message}[/red]")
+
 class TyperCommonOptions:
     """
     Generic Typer wrapper with:
@@ -283,6 +341,11 @@ class TyperCommonOptions:
             # Setup logging
             if hasattr(self.global_options, 'verbose'):
                 self._setup_logging(self.global_options.verbose)
+
+            # Display help when no command is provided
+            if ctx.invoked_subcommand is None:
+                print(ctx.get_help())
+                raise Exit()
 
         # Create function with dynamic signature
         callback_impl.__signature__ = inspect.Signature(params)
@@ -341,13 +404,8 @@ class TyperCommonOptions:
             try:
                 return func(*args, **kwargs)
             except CLIError as e:
-                # Show the error message but also the full stack trace
-                self.console.print(f"[bold red]CLI Error:[/bold red] {e.message}")
-                self.console.print(Panel(
-                    Text(traceback.format_exc(), style="red"),
-                    title="[bold red]Full Stack Trace[/bold red]",
-                    border_style="red"
-                ))
+                # Show only the error message for CLIError - no stack trace
+                self.console.print(f"[bold red]Error:[/bold red] {e.message}")
                 raise Exit(code=e.exit_code)
             except Exception as e:
                 # ALWAYS show full traceback for developers
@@ -962,6 +1020,9 @@ class DataApplication:
 
     def show_schema(self) -> SchemaResponse:
         """Get the schema of the data file."""
+        if self.state.df is None or self.state.file_path is None:
+            raise ValidationError("No input file specified")
+
         schema_data = self.get_schema()
         if not schema_data:
             raise ApplicationError("No schema data available")
@@ -987,6 +1048,9 @@ class DataApplication:
 
     def filter_records(self, query: str) -> FilterResponse:
         """Filter records and return the results."""
+        if self.state.df is None:
+            raise ValidationError("No input file specified")
+
         result_df = self.filter_data(query)
         if result_df is None:
             raise ApplicationError("Failed to filter data")
@@ -1050,6 +1114,186 @@ class DataApplication:
                 message=f"Tag '{field_name}' not found."
             )
 
+    def clean_cache(self, target_file: Optional[str] = None) -> CacheCleanResponse:
+        """Clean (remove) cached data for a specific file or all cache items."""
+        try:
+            # Use loaded file if no target_file specified
+            if target_file:
+                file_path = Path(target_file)
+                if not file_path.exists():
+                    return CacheCleanResponse(
+                        target_file=target_file,
+                        success=False,
+                        message=f"Target file not found: {target_file}",
+                        cleaned_ids=[]
+                    )
+                content_hash = self.get_content_hash(file_path)
+                effective_target_file = target_file
+
+                cache_path = self.get_cache_path(content_hash)
+                config_path = self.get_config_path(content_hash)
+
+                cleaned_ids = []
+
+                # Remove cache file if it exists
+                if cache_path.exists():
+                    cache_path.unlink()
+                    cleaned_ids.append(content_hash)
+                    logging.info(f"Removed cache file: {cache_path}")
+
+                # Remove config file if it exists
+                if config_path.exists():
+                    config_path.unlink()
+                    logging.info(f"Removed config file: {config_path}")
+
+                if cleaned_ids:
+                    return CacheCleanResponse(
+                        target_file=effective_target_file,
+                        success=True,
+                        message=f"Successfully cleaned cache for {effective_target_file}",
+                        cleaned_ids=cleaned_ids
+                    )
+                else:
+                    return CacheCleanResponse(
+                        target_file=effective_target_file,
+                        success=True,
+                        message=f"No cache files found for {effective_target_file}",
+                        cleaned_ids=[]
+                    )
+
+            elif self.state.file_path and self.state.content_hash:
+                # Use the currently loaded file
+                content_hash = self.state.content_hash
+                effective_target_file = str(self.state.file_path)
+
+                cache_path = self.get_cache_path(content_hash)
+                config_path = self.get_config_path(content_hash)
+
+                cleaned_ids = []
+
+                # Remove cache file if it exists
+                if cache_path.exists():
+                    cache_path.unlink()
+                    cleaned_ids.append(content_hash)
+                    logging.info(f"Removed cache file: {cache_path}")
+
+                # Remove config file if it exists
+                if config_path.exists():
+                    config_path.unlink()
+                    logging.info(f"Removed config file: {config_path}")
+
+                if cleaned_ids:
+                    return CacheCleanResponse(
+                        target_file=effective_target_file,
+                        success=True,
+                        message=f"Successfully cleaned cache for {effective_target_file}",
+                        cleaned_ids=cleaned_ids
+                    )
+                else:
+                    return CacheCleanResponse(
+                        target_file=effective_target_file,
+                        success=True,
+                        message=f"No cache files found for {effective_target_file}",
+                        cleaned_ids=[]
+                    )
+            else:
+                # Clean all cache items when no file specified and none loaded
+                cleaned_ids = []
+
+                # Ensure cache directories exist
+                if not CACHE_DIR.exists() and not CONFIG_DIR.exists():
+                    return CacheCleanResponse(
+                        target_file="all",
+                        success=True,
+                        message="No cache directories found",
+                        cleaned_ids=[]
+                    )
+
+                # Clean all .pkl files from cache directory
+                if CACHE_DIR.exists():
+                    for cache_file in CACHE_DIR.glob("*.pkl"):
+                        file_hash = cache_file.stem
+                        cache_file.unlink()
+                        cleaned_ids.append(file_hash)
+                        logging.info(f"Removed cache file: {cache_file}")
+
+                # Clean all .json files from config directory
+                if CONFIG_DIR.exists():
+                    for config_file in CONFIG_DIR.glob("*.json"):
+                        config_file.unlink()
+                        logging.info(f"Removed config file: {config_file}")
+
+                if cleaned_ids:
+                    return CacheCleanResponse(
+                        target_file="all",
+                        success=True,
+                        message=f"Successfully cleaned {len(cleaned_ids)} cache item(s)",
+                        cleaned_ids=cleaned_ids
+                    )
+                else:
+                    return CacheCleanResponse(
+                        target_file="all",
+                        success=True,
+                        message="No cache files found",
+                        cleaned_ids=[]
+                    )
+
+        except Exception as e:
+            return CacheCleanResponse(
+                target_file=target_file or "all",
+                success=False,
+                message=f"Error cleaning cache: {e}",
+                cleaned_ids=[]
+            )
+
+    def list_cache(self, target_file: Optional[str] = None) -> CacheListResponse:
+        """List all cache items, optionally highlighting a specific target file."""
+        cache_items = []
+
+        try:
+            # Ensure cache directory exists
+            if not CACHE_DIR.exists():
+                return CacheListResponse(cache_items=[])
+
+            # Get target file hash - use loaded file if no target_file specified
+            target_hash = None
+            effective_target_file = None
+
+            if target_file:
+                target_path = Path(target_file)
+                if target_path.exists():
+                    target_hash = self.get_content_hash(target_path)
+                    effective_target_file = target_file
+            elif self.state.file_path and self.state.content_hash:
+                # Use the currently loaded file
+                target_hash = self.state.content_hash
+                effective_target_file = str(self.state.file_path)
+
+            # Scan cache directory for .pkl files
+            for cache_file in CACHE_DIR.glob("*.pkl"):
+                file_hash = cache_file.stem  # filename without .pkl extension
+                file_size = cache_file.stat().st_size
+
+                # Determine if this cache file corresponds to the target file
+                target_filename = ""
+                if effective_target_file and file_hash == target_hash:
+                    target_filename = effective_target_file
+
+                cache_items.append(CacheItem(
+                    hash_full=file_hash,
+                    file_size=file_size,
+                    target_file=target_filename
+                ))
+
+            # Sort by hash for consistent output
+            cache_items.sort(key=lambda x: x.hash_full)
+
+        except Exception as e:
+            logging.error(f"Error listing cache: {e}")
+            # Return empty list on error rather than raising
+
+        return CacheListResponse(cache_items=cache_items)
+
 
 # --- CLI Command Handlers ---
 
@@ -1095,6 +1339,19 @@ def create_cli():
     ):
         """Remove a computed field (tag)."""
         return app.unset_tag(field_name)
+
+    # Cache subcommands - file-specific commands
+    cache_cli = cli.subcommand_group("cache", "Commands for managing file cache")
+
+    @cache_cli.command("clean", "clean_cache")
+    def cache_clean_cmd(app: DataApplication):
+        """Clean (remove) cached data for the loaded file."""
+        return app.clean_cache()
+
+    @cache_cli.command("ls", "list_cache")
+    def cache_list_cmd(app: DataApplication):
+        """List all cache items, highlighting the loaded file."""
+        return app.list_cache()
 
     return cli
 

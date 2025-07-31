@@ -110,6 +110,27 @@ Manage computed fields (tags) which are new columns derived from existing data.
 ./xq.py data.csv tag unset total-cost
 ```
 
+#### `cache clean`, `cache ls`
+
+Manage cached data files for improved performance.
+
+-   `<filename> cache clean`: Removes cached data and configuration for the specified file.
+-   `cache clean`: Removes all cached data and configuration files.
+-   `cache ls`: Lists all cache items with their SHA1 hashes, file sizes, and highlights the loaded file.
+
+**Usage:**
+
+```bash
+# Clean cache for the loaded file
+./xq.py data.csv cache clean
+
+# List all cache items (no file required)
+./xq.py cache ls
+
+# Clean all cache items (no file required)
+./xq.py cache clean
+```
+
 ### Computed Fields (Tags)
 
 When you create a computed field with `tag set`, you provide a name for the new field and an expression to calculate its value. This expression language is designed to be simple and intuitive, allowing you to reference other columns by their short names.
@@ -298,7 +319,7 @@ user-id, user-name, user-email, order-id, order-total, order-date
     ```bash
     # First create the computed field
     ./xq.py data.csv tag set total-with-tax "{price} * (1 + {tax})"
-    
+
     # Then filter using it
     ./xq.py data.csv flt "total-with-tax>50,product-name,total-with-tax"
     ```
