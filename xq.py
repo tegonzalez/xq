@@ -23,6 +23,7 @@ from rich.text import Text
 import typer
 from typer import Option, Argument, Exit, Typer, Context
 import re
+from markdown_it import MarkdownIt
 
 # --- CLI Framework ---
 
@@ -724,25 +725,110 @@ class DataApplication:
 
         return translated_expression
 
+    def _clean_dataframe_for_output(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean DataFrame for output by properly handling NaN values based on column types.
+        - String/object columns: NaN -> empty string ("")
+        - Numeric columns: NaN -> None
+        - Boolean columns: NaN -> None
+        Returns a copy of the DataFrame with cleaned values.
+        """
+        if df is None or df.empty:
+            return df
+
+        # Create a copy to avoid modifying the original
+        cleaned_df = df.copy()
+
+        for column in cleaned_df.columns:
+            col_data = cleaned_df[column]
+            col_dtype = col_data.dtype
+
+            logging.debug(f"Column '{column}' has dtype: {col_dtype}")
+
+            # Handle different data types appropriately
+            if pd.api.types.is_string_dtype(col_dtype):
+                # For string columns, replace NaN with empty string
+                cleaned_df[column] = col_data.fillna('')
+            elif pd.api.types.is_numeric_dtype(col_dtype):
+                # For numeric columns, replace NaN with None (which becomes null in JSON)
+                # Convert to object type first to allow None values
+                cleaned_df[column] = col_data.astype('object').where(pd.notna(col_data), None)
+            elif pd.api.types.is_bool_dtype(col_dtype):
+                # For boolean columns, replace NaN with None
+                cleaned_df[column] = col_data.astype('object').where(pd.notna(col_data), None)
+            elif col_dtype == 'object':
+                # For object columns, try to be smart about the content
+                # Check if it contains primarily numeric-like values
+                non_na_values = col_data.dropna()
+                if len(non_na_values) > 0:
+                    # Try to convert to numeric, if successful treat as numeric
+                    try:
+                        pd.to_numeric(non_na_values)
+                        # Looks like numeric data stored as object
+                        cleaned_df[column] = col_data.where(pd.notna(col_data), None)
+                        logging.debug(f"Column '{column}' object type treated as numeric")
+                    except (ValueError, TypeError):
+                        # Not numeric, treat as string
+                        cleaned_df[column] = col_data.fillna('')
+                        logging.debug(f"Column '{column}' object type treated as string")
+                else:
+                    # No non-NA values, default to empty string
+                    cleaned_df[column] = col_data.fillna('')
+            else:
+                # For other types, default to empty string
+                cleaned_df[column] = col_data.fillna('')
+
+        return cleaned_df
+
     def _sniff_file_type(self, file_path: Path) -> str:
         """Sniffs the file type by sampling content, ignoring comments."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content_sample = ""
+                content_lines = []
                 for line in f:
                     stripped_line = line.strip()
+                    content_lines.append(line)  # Keep original line for markdown analysis
                     if stripped_line and not stripped_line.startswith('#'):
                         content_sample += stripped_line
                     if len(content_sample) > 1024:
                         break
 
+            # Join lines for markdown pattern analysis
+            full_sample = ''.join(content_lines[:50])  # Look at first 50 lines
+
             # Primitive regex checks for JSON
             # Check for object start or array start
             if re.match(r'^\s*\{', content_sample) or re.match(r'^\s*\[', content_sample):
                  return 'json'
+
             # Check for CSV - look for comma-separated values in multiple lines
             if len(content_sample.splitlines()) > 1 and all(',' in line for line in content_sample.splitlines()[:2]):
                  return 'csv'
+
+            # Enhanced markdown detection using regex patterns
+            markdown_patterns = [
+                r'^#{1,6}\s+',  # Headers (H1-H6)
+                r'^\s*[-*+]\s+',  # Unordered lists
+                r'^\s*\d+\.\s+',  # Ordered lists
+                r'\[.*\]\(.*\)',  # Links
+                r'^\s*>\s+',  # Blockquotes
+                r'```[\s\S]*?```',  # Code blocks
+                r'`[^`]+`',  # Inline code
+                r'\*\*.*?\*\*',  # Bold text
+                r'\*.*?\*',  # Italic text
+                r'^\s*\|.*\|.*\|',  # Table rows
+                r'^\s*\|?\s*:?-+:?\s*\|'  # Table separator
+            ]
+
+            markdown_score = 0
+            for pattern in markdown_patterns:
+                if re.search(pattern, full_sample, re.MULTILINE):
+                    markdown_score += 1
+
+            # If we find 2 or more markdown patterns, classify as markdown
+            if markdown_score >= 2:
+                return 'markdown'
 
         except (IOError, UnicodeDecodeError):
             pass # Fallback to extension check
@@ -791,6 +877,142 @@ class DataApplication:
         # If the structure is not recognized, raise an error
         raise ApplicationError("Unsupported JSON structure. Expecting a list of objects or a dictionary of lists of objects.")
 
+    def _extract_tables_from_markdown(self, file_path: Path) -> pd.DataFrame:
+        """
+        Extracts all tables from a markdown file and combines them into a single DataFrame.
+        Each table gets a 'source_table' column indicating its origin.
+        Uses markdown-it-py AST for direct table parsing without HTML conversion.
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                markdown_content = f.read()
+
+            # Parse markdown to AST using markdown-it-py
+            md = MarkdownIt().enable(['table'])
+            tokens = md.parse(markdown_content)
+
+            # Extract tables from AST tokens
+            tables = self._extract_tables_from_tokens(tokens)
+
+            if not tables:
+                # No tables found, create a simple DataFrame with markdown metadata
+                logging.info("No tables found in markdown. Creating metadata DataFrame.")
+                metadata = self._extract_markdown_metadata(markdown_content)
+                return pd.DataFrame([metadata])
+
+            all_dataframes = []
+            for i, table_data in enumerate(tables):
+                headers = table_data['headers']
+                rows = table_data['rows']
+
+                if headers and rows:
+                    # Create DataFrame for this table
+                    # Ensure all rows have the same number of columns as headers
+                    max_cols = len(headers)
+                    normalized_rows = []
+                    for row in rows:
+                        # Pad short rows or truncate long rows
+                        if len(row) < max_cols:
+                            row.extend([''] * (max_cols - len(row)))
+                        elif len(row) > max_cols:
+                            row = row[:max_cols]
+                        normalized_rows.append(row)
+
+                    table_df = pd.DataFrame(normalized_rows, columns=headers)
+                    table_df['source_table'] = f"table_{i+1}"
+                    all_dataframes.append(table_df)
+                    logging.info(f"Extracted table {i+1} with {len(table_df)} rows and {len(headers)} columns")
+
+            if all_dataframes:
+                # Combine all tables into a single DataFrame
+                combined_df = pd.concat(all_dataframes, ignore_index=True, sort=False)
+                return combined_df
+            else:
+                # No valid tables found, create metadata DataFrame
+                metadata = self._extract_markdown_metadata(markdown_content)
+                return pd.DataFrame([metadata])
+
+        except Exception as e:
+            raise ApplicationError(f"Error processing markdown file: {e}")
+
+    def _extract_tables_from_tokens(self, tokens) -> List[Dict[str, Any]]:
+        """
+        Extracts table data from markdown-it-py AST tokens.
+        Returns a list of dictionaries with 'headers' and 'rows' keys.
+        """
+        tables = []
+        current_table = None
+
+        for token in tokens:
+            if token.type == 'table_open':
+                current_table = {'headers': [], 'rows': []}
+            elif token.type == 'table_close':
+                if current_table and (current_table['headers'] or current_table['rows']):
+                    tables.append(current_table)
+                current_table = None
+            elif token.type == 'thead_open':
+                # Header section starts
+                pass
+            elif token.type == 'tbody_open':
+                # Body section starts
+                pass
+            elif token.type == 'tr_open':
+                # New row starts
+                if current_table is not None:
+                    current_table['current_row'] = []
+            elif token.type == 'tr_close':
+                # Row ends
+                if current_table is not None and 'current_row' in current_table:
+                    row = current_table.pop('current_row', [])
+                    if row:  # Only add non-empty rows
+                        # Determine if this is a header row or data row
+                        # Headers are typically in the first few rows and may be in thead
+                        if not current_table['headers'] and row:
+                            current_table['headers'] = row
+                        else:
+                            current_table['rows'].append(row)
+            elif token.type == 'th_open' or token.type == 'td_open':
+                # Cell starts - prepare to collect content
+                if current_table is not None and 'current_row' in current_table:
+                    current_table['current_cell'] = []
+            elif token.type == 'th_close' or token.type == 'td_close':
+                # Cell ends
+                if current_table is not None and 'current_row' in current_table:
+                    cell_content = ''.join(current_table.pop('current_cell', []))
+                    current_table['current_row'].append(cell_content.strip())
+            elif token.type == 'inline' and current_table is not None and 'current_cell' in current_table:
+                # Text content within a cell
+                current_table['current_cell'].append(token.content)
+
+        return tables
+
+    def _extract_markdown_metadata(self, content: str) -> Dict[str, Any]:
+        """
+        Extracts metadata from markdown content when no tables are found.
+        Returns a dictionary with document structure information.
+        """
+        metadata = {
+            'file_type': 'markdown',
+            'line_count': len(content.splitlines()),
+            'char_count': len(content),
+            'word_count': len(content.split())
+        }
+
+        # Count markdown elements
+        metadata['header_count'] = len(re.findall(r'^#{1,6}\s+', content, re.MULTILINE))
+        metadata['list_item_count'] = len(re.findall(r'^\s*[-*+]\s+|^\s*\d+\.\s+', content, re.MULTILINE))
+        metadata['link_count'] = len(re.findall(r'\[.*?\]\(.*?\)', content))
+        metadata['code_block_count'] = len(re.findall(r'```[\s\S]*?```', content))
+        metadata['table_count'] = len(re.findall(r'^\s*\|.*\|', content, re.MULTILINE))
+
+        # Extract first few headers as a preview
+        headers = re.findall(r'^(#{1,6})\s+(.+)$', content, re.MULTILINE)
+        if headers:
+            metadata['first_header'] = headers[0][1]
+            metadata['header_level'] = len(headers[0][0])
+
+        return metadata
+
     def load_data(self, file_path_str: str):
         """Loads data from a file, using cache if available."""
         file_path = Path(file_path_str)
@@ -822,8 +1044,15 @@ class DataApplication:
                     self.state.df = self._transform_json_generically(json_data)
                 elif file_type == 'csv' or file_ext == '.csv':
                     self.state.df = pd.read_csv(file_path)
+                elif file_type == 'markdown' or file_ext == '.md' or file_ext == '.markdown':
+                    self.state.df = self._extract_tables_from_markdown(file_path)
                 else:
-                    raise ApplicationError(f"Unsupported or unrecognized file type: {file_ext}")
+                    # Enhanced fallback logic - try to detect as markdown if extension suggests it
+                    if file_ext in ['.md', '.markdown', '.mdown', '.mkd']:
+                        logging.info(f"File extension {file_ext} suggests markdown, attempting markdown processing")
+                        self.state.df = self._extract_tables_from_markdown(file_path)
+                    else:
+                        raise ApplicationError(f"Unsupported or unrecognized file type: {file_ext}")
 
                 with open(cache_path, 'wb') as f:
                     pickle.dump(self.state.df, f)
@@ -1055,7 +1284,9 @@ class DataApplication:
         if result_df is None:
             raise ApplicationError("Failed to filter data")
 
-        records = [dict(row) for _, row in result_df.iterrows()]
+        # Clean the DataFrame for output (handle NaN values appropriately by type)
+        cleaned_df = self._clean_dataframe_for_output(result_df)
+        records = [dict(row) for _, row in cleaned_df.iterrows()]
 
         return FilterResponse(records=records)
 

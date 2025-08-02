@@ -1,10 +1,11 @@
-# xq - Simple CLI Excel/JSON/CSV Query Tool
+# xq - Simple CLI Excel/JSON/CSV/Markdown Query Tool
 
-XQ is a command-line tool for performing read-only queries on structured data files like `.xlsx`, `.json`, and `.csv`. It provides a simple command style interface to pandas dataframes - allowing you to quickly inspect data schemas and filter records directly from your terminal.
+XQ is a command-line tool for performing read-only queries on structured data files like `.xlsx`, `.json`, `.csv`, and `.md`. It provides a simple command style interface to pandas dataframes - allowing you to quickly inspect data schemas and filter records directly from your terminal.
 
 ## Features
 
-- **File Support**: Works with Excel (`.xlsx`), JSON (`.json`), and CSV (`.csv`) files.
+- **File Support**: Works with Excel (`.xlsx`), JSON (`.json`), CSV (`.csv`), and Markdown (`.md`) files.
+- **Markdown Table Processing**: Automatically extracts and flattens all tables from markdown files with a `source_table` field to identify table origins.
 - **Schema Inspection**: Quickly view column names, their data types, and generated short-name aliases.
 - **Powerful Filtering**: A simple query language to filter records.
 - **Wildcard Field Selection**: Use `*` and `?` patterns to match multiple fields at once.
@@ -294,6 +295,26 @@ user-id, user-name, user-email, order-id, order-total, order-date
 
     ```bash
     ./xq.py inventory.json flt "*"
+    ```
+
+#### Markdown Table Processing
+
+-   **Extract All Tables**: Process all tables from a markdown document.
+
+    ```bash
+    ./xq.py document.md flt "*"
+    ```
+
+-   **Filter Specific Table**: Show data only from the first table.
+
+    ```bash
+    ./xq.py document.md flt "source_table=table_1,*"
+    ```
+
+-   **Cross-Table Analysis**: Find entries across all tables with specific criteria.
+
+    ```bash
+    ./xq.py report.md flt "price>100,name,price,source_table"
     ```
 
 -   **Specific + Remaining**: Show key fields first, then everything else.
